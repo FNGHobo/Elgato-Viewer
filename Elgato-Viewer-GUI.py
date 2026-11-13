@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
+# Base Void Linux Support
 import os
 import sys
 import subprocess
 import locale
 import signal
+import re
 from datetime import datetime
 
 # ==========================================
 # CRITICAL FIXES (Must be before imports)
 # ==========================================
-# Fix Qt UTF-8 warning while keeping C locale for libmpv
 os.environ["LANG"] = "C.UTF-8"
 os.environ["LC_ALL"] = "C.UTF-8"
 os.environ["LC_NUMERIC"] = "C" 
 locale.setlocale(locale.LC_NUMERIC, "C")
-
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 import mpv
@@ -24,7 +24,6 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QCursor, QIcon, QDesktopServices, QKeySequence
 
-# Setup Directories
 HOME = os.path.expanduser("~")
 SCREENSHOT_DIR = os.path.join(HOME, "Pictures", "Elgato")
 VIDEO_DIR = os.path.join(HOME, "Videos", "Elgato")
@@ -94,6 +93,8 @@ class ElgatoViewer(QMainWindow):
             print("❌ Error: Could not find Elgato video device.")
             sys.exit(1)
 
+        width, height, fps = self.detect_resolution()
+
         self.setup_menu()
         self.setup_statusbar()
 
@@ -113,17 +114,30 @@ class ElgatoViewer(QMainWindow):
         if self.audio_src and self.audio_sink:
             self.start_audio_loopback()
 
-        print("Initializing MPV...")
+        print(f"Initializing MPV at {width}x{height} @ {fps}fps...")
         self.player = mpv.MPV(
             wid=str(int(self.video_widget.winId())),
+            
+            # Standard GPU rendering
+            gpu_context='x11egl',
+            vo='gpu',
+            hwdec='vaapi',
+            
+            # Disable MPV keyboard stealing
             input_default_bindings=False,
             input_vo_keyboard=False,
             osc=False,
-            profile='low-latency',
-            gpu_context='x11egl',
-            vo='gpu-next',
-            hwdec='vaapi',
-            demuxer_lavf_o='input_format=yuyv422,video_size=3840x2160,framerate=60',
+            
+            # --- LOW LATENCY & ANTI-TEARING ---
+            cache='no', 
+            demuxer_readahead_secs=0,
+            
+            # Enable VSync to prevent tearing, without heavy buffering
+            video_sync='display-resample',
+            
+            # Dynamic resolution
+            demuxer_lavf_o=f'input_format=yuyv422,video_size={width}x{height},framerate={fps}',
+            
             tone_mapping='reinhard',
             hdr_compute_peak=True,
             target_colorspace_hint='no',
@@ -140,12 +154,25 @@ class ElgatoViewer(QMainWindow):
         self.cursor_timer.timeout.connect(self.hide_cursor)
         self.cursor_timer.start(2000)
 
+    def detect_resolution(self):
+        try:
+            out = run_command(f"v4l2-ctl --get-fmt-video -d {self.video_dev}")
+            match = re.search(r"Width/Height\s*:\s*(\d+)/(\d+)", out)
+            if match:
+                width = int(match.group(1))
+                height = int(match.group(2))
+            else:
+                width, height = 1920, 1080
+            
+            fps = 60
+            return width, height, fps
+        except Exception:
+            return 1920, 1080, 60
+
     def setup_menu(self):
         menubar = self.menuBar()
 
-        # File Menu
         file_menu = menubar.addMenu("File")
-
         open_screenshots = QAction("Open Screenshot Folder", self)
         open_screenshots.triggered.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(SCREENSHOT_DIR)))
         file_menu.addAction(open_screenshots)
@@ -162,9 +189,7 @@ class ElgatoViewer(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
-        # Capture Menu
         capture_menu = menubar.addMenu("Capture")
-
         self.screenshot_action = QAction("Take Screenshot", self)
         self.screenshot_action.setShortcut(QKeySequence("Ctrl+S"))
         self.screenshot_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -177,16 +202,13 @@ class ElgatoViewer(QMainWindow):
         self.record_action.triggered.connect(self.toggle_recording)
         capture_menu.addAction(self.record_action)
 
-        # View Menu
         view_menu = menubar.addMenu("View")
-
         fullscreen_action = QAction("Toggle Fullscreen", self)
         fullscreen_action.setShortcut(QKeySequence("F11"))
         fullscreen_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         fullscreen_action.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(fullscreen_action)
 
-        # Settings Menu
         settings_menu = menubar.addMenu("Settings")
         prefs_action = QAction("Preferences...", self)
         prefs_action.triggered.connect(self.open_settings)
@@ -212,19 +234,15 @@ class ElgatoViewer(QMainWindow):
             self.record_file = os.path.join(VIDEO_DIR, f"recording_{timestamp}.mkv")
             self.player.command('set', 'stream-record', self.record_file)
             self.is_recording = True
-
             self.record_action.setText("Stop Recording")
             self.rec_label.setText("🔴 REC")
             self.status_bar.showMessage(f"Recording started: {self.record_file}", 4000)
-            print(f"⏺️ Recording started: {self.record_file}")
         else:
             self.player.command('set', 'stream-record', 'no')
             self.is_recording = False
-
             self.record_action.setText("Start Recording")
             self.rec_label.setText("")
             self.status_bar.showMessage(f"Recording saved: {self.record_file}", 4000)
-            print(f"⏹️ Recording stopped: {self.record_file}")
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
